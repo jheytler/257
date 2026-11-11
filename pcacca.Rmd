@@ -1,0 +1,238 @@
+---
+title: "CCA vs PCA+CCA"
+output: html_document
+date: "2026-11-07"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r population}
+invroot <- function(covmat) {
+  eig <- eigen(covmat, symmetric = TRUE)
+  eig$vectors %*% diag(1 / sqrt(eig$values), nrow = length(eig$values)) %*% t(eig$vectors)
+}
+
+truecca <- function(cov1, cov2, cov12) {
+  root1 <- invroot(cov1)
+  eig <- eigen(root1 %*% cov12 %*% solve(cov2) %*% t(cov12) %*% root1, symmetric = TRUE)
+  list(cor = sqrt(eig$values[1]), weights = root1 %*% eig$vectors[, 1])
+}
+```
+
+```{r params}
+set.seed(67)
+pergroup  <- 25
+highnum   <- 5
+highvar   <- 10
+linkednum <- 3
+linkcor   <- 0.2
+trainsize <- c(60, 100, 200, 500, 1000)
+pckept    <- c(1, 3, 5, 10, 15)
+reps      <- 200
+testsize  <- 5000
+set1cols  <- 1:pergroup
+set2cols  <- (pergroup + 1):(2 * pergroup)
+
+scenarios <- c("3 High-Variance"                 = 3,
+               "2 High-Variance, 1 Low-Variance" = 2,
+               "1 High-Variance, 2 Low-Variance" = 1,
+               "3 Low-Variance"                  = 0)
+```
+
+```{r generation}
+makepop <- function(highlinked) {
+  linkedvars <- c(seq_len(highlinked), highnum + seq_len(linkednum - highlinked))
+
+  corwithin <- diag(pergroup)
+  corwithin[linkedvars, linkedvars] <- linkcor
+  diag(corwithin) <- 1
+  corbetween <- matrix(0, pergroup, pergroup)
+  corbetween[linkedvars, linkedvars] <- linkcor
+  cormat <- rbind(cbind(corwithin, corbetween), cbind(t(corbetween), corwithin))
+
+  variances <- c(rep(highvar, highnum), rep(1, pergroup - highnum))
+  sds       <- diag(sqrt(c(variances, variances)))
+  covmat    <- sds %*% cormat %*% sds
+
+  cov1  <- covmat[set1cols, set1cols]
+  cov2  <- covmat[set2cols, set2cols]
+  cov12 <- covmat[set1cols, set2cols]
+  truth <- truecca(cov1, cov2, cov12)
+  list(covmat = covmat, cov1 = cov1, cov2 = cov2, cov12 = cov12,
+       cor = truth$cor, weights = truth$weights)
+}
+
+drawdata <- function(n, pop) {
+  alldata <- MASS::mvrnorm(n, mu = rep(0, 2 * pergroup), Sigma = pop$covmat)
+  list(set1 = alldata[, set1cols], set2 = alldata[, set2cols])
+}
+```
+
+```{r eda, fig.width=8, fig.height=3, out.width="100%"}
+pop <- makepop(1)
+dat <- drawdata(200, pop)
+alldata <- cbind(dat$set1, dat$set2)
+linked <- c(1, 6, 7)
+
+par(mfrow = c(1, 3), mar = c(4.5, 4.5, 3, 1))
+
+shown   <- c(1:10, 26:35)
+labels  <- c(paste0(1:10, "(1)"), paste0(1:10, "(2)"))
+colours <- hcl.colors(21, "Blue-Red 3")
+
+cormat <- cov2cor(pop$covmat)[shown, shown]
+image(1:20, 1:20, cormat[, 20:1],
+      col = colours, zlim = c(-0.4, 0.4), axes = FALSE,
+      main = "True correlations", xlab = "", ylab = "")
+axis(1, 1:20, labels, las = 2, cex.axis = 0.6)
+axis(2, 20:1, labels, las = 1, cex.axis = 0.6)
+abline(v = 10.5, h = 10.5, lwd = 2)
+
+cormat <- cor(alldata)[shown, shown]
+diag(cormat) <- NA
+image(1:20, 1:20, cormat[, 20:1],
+      col = colours, zlim = c(-0.4, 0.4), axes = FALSE,
+      main = "Sample correlations (n = 200)", xlab = "", ylab = "")
+axis(1, 1:20, labels, las = 2, cex.axis = 0.6)
+axis(2, 20:1, labels, las = 1, cex.axis = 0.6)
+abline(v = 10.5, h = 10.5, lwd = 2)
+
+barplot(apply(alldata, 2, var), col = ifelse(rep(1:25, 2) %in% linked, "red", "gray"),
+        border = NA, space = 0,
+        main = "Sample variances", xlab = "Variable", ylab = "Variance")
+abline(v = 25, lwd = 2)
+legend("topright", c("Linked", "Not linked"), fill = c("red", "gray"), bty = "n")
+```
+
+```{r methods}
+fitcca <- function(dat) {
+  fit <- cancor(dat$set1, dat$set2)
+  list(cor = fit$cor[1], w1 = fit$xcoef[, 1], w2 = fit$ycoef[, 1])
+}
+
+fitpcacca <- function(dat, npc) {
+  dirs1 <- eigen(cov(dat$set1), symmetric = TRUE)$vectors[, 1:npc, drop = FALSE]
+  dirs2 <- eigen(cov(dat$set2), symmetric = TRUE)$vectors[, 1:npc, drop = FALSE]
+  fit   <- cancor(dat$set1 %*% dirs1, dat$set2 %*% dirs2)
+  list(cor = fit$cor[1], w1 = dirs1 %*% fit$xcoef[, 1], w2 = dirs2 %*% fit$ycoef[, 1])
+}
+```
+
+```{r scoring}
+score <- function(fit, pop, test) {
+  fitted1 <- test$set1 %*% fit$w1
+  fitted2 <- test$set2 %*% fit$w2
+  true1   <- test$set1 %*% pop$weights
+  c(training  = fit$cor,
+    test      = abs(cor(fitted1, fitted2)),
+    recovery  = abs(cor(fitted1, true1)))
+}
+```
+
+```{r simulation}
+methods <- c("CCA", paste0("PCA(", pckept, ")+CCA"))
+pops    <- lapply(scenarios, makepop)
+tests   <- lapply(pops, function(pop) drawdata(testsize, pop))
+round(sapply(pops, `[[`, "cor"), 3)
+
+design <- expand.grid(scenario = names(pops), n = trainsize, rep = 1:reps,
+                      stringsAsFactors = FALSE)
+
+results <- do.call(rbind, lapply(seq_len(nrow(design)), function(i) {
+  cell   <- design[i, ]
+  pop    <- pops[[cell$scenario]]
+  dat    <- drawdata(cell$n, pop)
+  fits   <- c(list(fitcca(dat)), lapply(pckept, function(npc) fitpcacca(dat, npc)))
+  scores <- t(sapply(fits, score, pop = pop, test = tests[[cell$scenario]]))
+  data.frame(scenario = cell$scenario, n = cell$n, rep = cell$rep,
+             method = methods, scores, row.names = NULL)
+}))
+results$method <- factor(results$method, levels = methods)
+
+means <- aggregate(cbind(training, test, recovery) ~ scenario + n + method,
+                   data = results, FUN = mean)
+means$scenario <- factor(means$scenario, levels = names(scenarios))
+means <- means[order(means$scenario, means$n, means$method), ]
+means$truecor <- sapply(as.character(means$scenario), function(s) pops[[s]]$cor)
+
+numeric <- vapply(means, is.numeric, logical(1))
+means[numeric] <- lapply(means[numeric], round, digits = 3)
+print(means, row.names = FALSE)
+write.csv(results, "sim-raw.csv",     row.names = FALSE)
+write.csv(means,   "sim-summary.csv", row.names = FALSE)
+```
+
+```{r tables}
+library(kableExtra)
+shown <- c(60, 200, 1000)
+summ  <- aggregate(cbind(training, test, recovery) ~ method + n,
+                   data = results[results$n %in% shown, ], FUN = mean)
+wide  <- reshape(summ, idvar = "method", timevar = "n", direction = "wide")
+
+header <- c(" " = 1, setNames(rep(3, length(shown)), paste("n =", shown)))
+cols   <- c("Method", rep(c("Training", "Test", "Recovery"), length(shown)))
+
+truecor <- pops[[1]]$cor  
+
+bold_best <- function(k, df, digits = 3) {
+  for (j in 2:ncol(df)) {
+    x <- round(df[[j]], digits)
+    if (startsWith(names(df)[j], "training")) {
+      d <- abs(x - truecor)                      
+      k <- column_spec(k, j, bold = !is.na(d) & d == min(d, na.rm = TRUE))
+    } else {
+      k <- column_spec(k, j, bold = !is.na(x) & x == max(x, na.rm = TRUE))
+    }
+  }
+  k
+}
+
+tab <- kbl(wide, format = "latex", booktabs = TRUE, digits = 3, row.names = FALSE,
+           col.names = cols) |>
+  bold_best(wide) |>
+  add_header_above(header) |>
+  kable_styling(latex_options = c("hold_position", "scale_down"))
+writeLines(as.character(tab), "sim-table.tex")
+
+kbl(wide, digits = 3, row.names = FALSE, col.names = cols) |>
+  bold_best(wide) |>
+  add_header_above(header) |>
+  kable_styling(full_width = FALSE)
+```
+
+```{r plot, fig.width=14, fig.height=12, out.width="100%"}
+metrics <- c(training  = "Training Set Correlation",
+             test      = "Test Set Correlation",
+             recovery  = "Recovery of True U1")
+colours  <- c("black", hcl.colors(length(pckept), "Dark 3"))
+nmetrics <- length(metrics)
+nscen    <- length(pops)
+
+layout(cbind(matrix(seq_len(nscen * nmetrics), nrow = nscen, byrow = TRUE),
+             nscen * nmetrics + 1),
+       widths = c(rep(1, nmetrics), 0.8))
+par(mar = c(4.2, 4.2, 2.5, 1), cex.main = 0.9)
+
+for (scen in names(pops)) {
+  rows <- means[means$scenario == scen, ]
+  for (metric in names(metrics)) {
+    plot(NA, xlim = range(log10(trainsize)), ylim = c(0, 1), xaxt = "n",
+         xlab = "Training Set Size", ylab = metrics[metric],
+         main = sprintf("%s: %s", scen, metrics[metric]))
+    axis(1, at = log10(trainsize), labels = trainsize)
+    abline(h = if (metric == "recovery") 1 else pops[[scen]]$cor, lty = 2, col = "gray")
+    for (j in seq_along(methods)) {
+      line   <- rows[rows$method == methods[j], ]
+      offset <- (j - (length(methods) + 1) / 2) * 0.012
+      lines(log10(line$n) + offset, line[[metric]], col = colours[j], lwd = 2,
+            type = "b", pch = 19)
+    }
+  }
+}
+
+par(mar = c(0, 0, 0, 0)); plot.new()
+legend("center", legend = c(methods, "truth"), col = c(colours, "gray"),
+       lwd = 2, lty = c(rep(1, length(methods)), 2), bty = "n", cex = 0.9)
+```
